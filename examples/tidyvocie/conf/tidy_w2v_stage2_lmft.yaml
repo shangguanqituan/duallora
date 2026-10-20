@@ -1,0 +1,115 @@
+# TidyVoice Stage 2: Large Margin Fine-tuning (LMFT)
+# 核心策略：基于 Stage 1 融合后的底座，开启新一轮 LoRA 进行大间隔精调
+
+# -------------------------------------------------------------------
+# 基础设置
+# -------------------------------------------------------------------
+exp_dir: exp/tidy_w2vbert_lora_s2_lmft
+gpus: "[0,1,2,3,4,5,6,7]"
+num_avg: 1                 # LMFT 通常只取最后一个模型，或者最后2-3个平均
+enable_amp: True
+seed: 42
+do_lm: True                # 标记为 Large Margin 阶段
+
+# -------------------------------------------------------------------
+# 训练周期
+# -------------------------------------------------------------------
+# LMFT 只是为了拉大类间距，不需要跑太久，3个 Epoch 足够
+num_epochs: 3
+save_epoch_interval: 1
+log_batch_interval: 100
+
+# -------------------------------------------------------------------
+# 数据加载
+# -------------------------------------------------------------------
+dataloader_args:
+  batch_size: 24           # 长切片显存占用大，BatchSize 适当减小 (16*8=128 全局BS)
+  num_workers: 8
+  pin_memory: False
+  prefetch_factor: 4
+  drop_last: True
+
+# -------------------------------------------------------------------
+# 数据集参数 (LMFT 特有设置：长切片、无增强)
+# -------------------------------------------------------------------
+dataset_args:
+  sample_num_per_epoch: 0
+  shuffle: True
+  shuffle_args:
+    shuffle_size: 2500
+  filter: True
+  filter_args:
+    min_num_frames: 200
+    max_num_frames: 800    # 8秒上限
+  resample_rate: 16000
+
+  # [重点] LMFT 阶段通常关闭数据增强，让模型专注于干净语音的细微差别
+  speed_perturb: True     # 关闭变速
+  num_frms: 600            # [修改] 6秒长切片 (S1 是 3秒)
+  aug_prob: 0.3            # [修改] 关闭噪声/混响增强
+
+  frontend: "w2vbert"
+  w2vbert_args:
+    model_name: "/data0/sgqt7/PTMs/w2v-bert-2.0"
+    frozen: True           # [关键] 必须继续冻结！防止破坏 S1 学到的跨语言能力
+    use_lora: True         # [关键] 开启新一轮 LoRA
+    lora_config_args:
+      # 保持与 Stage 1 一致的轻量级配置
+      r: 16
+      lora_alpha: 32
+      target_modules: ["linear_q", "linear_v"]
+      lora_dropout: 0.1
+      bias: 'none'
+
+# -------------------------------------------------------------------
+# 模型定义
+# -------------------------------------------------------------------
+model: W2VBert_Adapter_MFA
+# 注意：实际运行时，run_tidy_w2v.sh 里的 --checkpoint 参数会覆盖这里
+# 但为了配置完整性，指向 Stage 1 的合并模型是好习惯
+model_init: exp/tidy_w2vbert_lora_s1/models/merged_avg_model_for_s2.pt
+model_args:
+  feat_dim: 1024
+  embed_dim: 256
+  pooling_func: "ASP"
+  n_mfa_layers: -1
+  adapter_dim: 128
+  dropout: 0.2             # LMFT 数据质量高，且 Steps 少，可以尝试移除 Dropout
+
+# -------------------------------------------------------------------
+# 损失与 Margin (核心目标)
+# -------------------------------------------------------------------
+projection_args:
+  project_type: arc_margin
+  scale: 32.0
+  easy_margin: false
+
+margin_scheduler: MarginScheduler
+margin_update:
+  initial_margin: 0.0
+  final_margin: 0.4
+  increase_start_epoch: 0
+  fix_start_epoch: 2
+  update_margin: true
+  increase_type: linear
+
+loss: CrossEntropyLoss
+loss_args: {}
+
+# -------------------------------------------------------------------
+# 优化器
+# -------------------------------------------------------------------
+optimizer: AdamW
+optimizer_args:
+  lr: 1.0e-5               # [关键] 极小的学习率，微调 LoRA 权重
+  weight_decay: 1.0e-4
+
+# -------------------------------------------------------------------
+# 调度器
+# -------------------------------------------------------------------
+scheduler: WarmupCosineScheduler
+scheduler_args:
+  min_lr: 5.0e-6
+  max_lr: 1.0e-5           # 对应 optimizer 的 lr
+  warmup_epoch: 0          # LMFT 不需要热身，直接微调
+  fix_epoch: 0

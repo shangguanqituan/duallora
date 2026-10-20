@@ -1,0 +1,108 @@
+# Fine-tune W2V-BERT 2.0 + Adapter MFA on TidyVoice
+# Based on SimAM-ResNet34 Baseline & W2V-BERT S3 config
+
+# -------------------------------------------------------------------
+# Experiment & hardware
+# -------------------------------------------------------------------
+exp_dir: exp/W2VBert_AdapterMFA_tidyvoice_ft
+gpus: "[0,1]"
+num_avg: 1
+enable_amp: true           # 保持 True，Transformer 显存占用大，需要混合精度
+seed: 42                   # Match Baseline
+do_lm: true
+
+# Epochs (Match Baseline)
+num_epochs: 8
+save_epoch_interval: 1
+log_batch_interval: 100
+
+
+# -------------------------------------------------------------------
+# Data loader
+# -------------------------------------------------------------------
+data_type: shard           # TidyVoice run.sh 默认生成 shard 格式
+
+dataloader_args:
+  batch_size: 16            # W2V-BERT 比较吃显存，单卡4-8左右
+  num_workers: 8
+  pin_memory: false
+  prefetch_factor: 4
+  drop_last: true
+
+# -------------------------------------------------------------------
+# Dataset (完全对齐 Baseline 设置)
+# -------------------------------------------------------------------
+dataset_args:
+  sample_num_per_epoch: 0
+  shuffle: true
+  shuffle_args:
+    shuffle_size: 2500
+  filter: true
+  filter_args:
+    min_num_frames: 200    # 2秒，Match Baseline
+    max_num_frames: 800    # 8秒，Match Baseline
+  resample_rate: 16000
+  speed_perturb: false     # Match Baseline: 关闭变速
+  num_frms: 600            # 6秒，Match Baseline
+  aug_prob: 0.3            # Match Baseline: 弱增强 (原 W2V-BERT S3 是 0.0，这里稍微加一点)
+
+  # Frontend 设置
+  frontend: "w2vbert"
+  w2vbert_args:
+    model_name: "/data0/sgqt7/PTMs/w2v-bert-2.0"
+    frozen: False
+    use_lora: False
+    lora_config_args: null
+
+# -------------------------------------------------------------------
+# Model
+# -------------------------------------------------------------------
+model: W2VBert_Adapter_MFA
+model_init: /data0/sgqt7/PTMs/w2v_bert2_voxblink_official_LM.pth
+model_args:
+  feat_dim: 1024
+  embed_dim: 256
+  pooling_func: "ASP"
+  n_mfa_layers: -1
+  adapter_dim: 128
+  dropout: 0.1             # 稍微给一点 Dropout 防止过拟合
+  num_frontend_hidden_layers: 24
+
+# -------------------------------------------------------------------
+# Projection & Margin (参考 Baseline 修改)
+# -------------------------------------------------------------------
+projection_args:
+  project_type: "arc_margin"
+  scale: 32.0
+  easy_margin: false
+
+# 策略调整：Baseline 是 0.0->0.3。
+# 考虑到 W2V-BERT 能力更强，我们设定目标为 0.35 或 0.4，但同样采用渐进式增长
+margin_scheduler: MarginScheduler
+margin_update:
+  initial_margin: 0.0      # 从 0 开始
+  final_margin: 0.35       # 最终稍微比 ResNet 高一点点 (ResNet是0.3)
+  increase_start_epoch: 0
+  fix_start_epoch: 4
+  update_margin: True
+  increase_type: "linear"
+
+# -------------------------------------------------------------------
+# Loss and optimization
+# -------------------------------------------------------------------
+loss: CrossEntropyLoss
+loss_args: {}
+
+# W2V-BERT 必须用 AdamW，不能用 SGD
+optimizer: AdamW
+optimizer_args:
+  lr: 1.0e-5               # 小学习率
+  weight_decay: 1.0e-4
+
+# Scheduler
+scheduler: WarmupCosineScheduler
+scheduler_args:
+  min_lr: 5.0e-6
+  max_lr: 2.0e-5
+  warmup_epoch: 1          # 给 1 个 epoch 热身适应新的分类头
+  fix_epoch: 0

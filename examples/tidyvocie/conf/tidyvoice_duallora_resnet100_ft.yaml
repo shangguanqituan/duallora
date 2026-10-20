@@ -1,0 +1,123 @@
+# conf/dual_lora.yaml
+
+# -------------------------------------------------------------------
+# Experiment & hardware
+# -------------------------------------------------------------------
+exp_dir: exp/dual_lora_samresnet100_tidy
+gpus: [0,1] # 根据实际情况改
+num_avg: 1
+enable_amp: true # LoRA 训练显存占用小，不开 AMP 也可以，开了更快
+
+do_lm: true
+seed: 42
+num_epochs: 3 # Fine-tune 通常轮数不用太多，但 LoRA 收敛可能需要一点时间，建议 10-15
+save_epoch_interval: 1
+log_batch_interval: 500
+
+# -------------------------------------------------------------------
+# Loss Weights (Executor 需要的自定义参数)
+# -------------------------------------------------------------------
+loss_weights:
+  spk: 1
+  lang: 0.5
+  orth: 0.1
+  adv: 0
+
+# -------------------------------------------------------------------
+# Data loader
+# -------------------------------------------------------------------
+data_type: shard
+train_data: data/tidyvoice_train/shards/train.shard.list # 确保路径对
+train_label: data/tidyvoice_train/utt2spk # 用于生成 spk2id 和 lang2id
+
+dataloader_args:
+  batch_size: 8 # LoRA 省显存，BatchSize 可以大一点，有助于 SubCenter 收敛
+  num_workers: 8
+  pin_memory: false
+  prefetch_factor: 8
+  drop_last: true
+
+# -------------------------------------------------------------------
+# Dataset
+# -------------------------------------------------------------------
+dataset_args:
+  sample_num_per_epoch: 0
+  shuffle: true
+  shuffle_args:
+    shuffle_size: 2500
+  filter: true
+  filter_args:
+    min_num_frames: 200
+    max_num_frames: 700
+  resample_rate: 16000
+  speed_perturb: false # Fine-tune 且做 LoRA 时，通常不开变速，专注于音色和语言解耦
+  num_frms: 600       # 训练时的切片长度
+  aug_prob: 0.3       # 弱增强
+  fbank_args:
+    num_mel_bins: 80
+    frame_shift: 10
+    frame_length: 25
+    dither: 1.0
+  spec_aug: true      # 建议开启 SpecAug 防止过拟合
+  spec_aug_args:
+    num_t_mask: 1
+    num_f_mask: 1
+    max_t: 10
+    max_f: 8
+    prob: 0.6
+
+# -------------------------------------------------------------------
+# Model
+# -------------------------------------------------------------------
+model: DualLoRA_SimAM_ResNet100
+# 注意：这里不要填 model_init，因为我们会用自定义逻辑加载
+# model_init: /data0/sgqt7/PTMs/samresnet100.pt
+model_args:
+  feat_dim: 80
+  embed_dim: 256
+  pooling_func: 'ASP'
+  dropout: 0.0
+  spk_rank: 16
+  lang_rank: 4
+
+# -------------------------------------------------------------------
+# Projection (Sub-Center ArcFace)
+# -------------------------------------------------------------------
+projection_args:
+  project_type: arc_margin_intertopk_subcenter
+  scale: 32.0
+  easy_margin: false
+  K: 3                # 3 个子中心应对多语言
+  mp: 0.06
+  k_top: 5
+  do_lm: true         # 开启 LMF 模式
+
+# Margin Scheduler (Sub-Center 配合 Warmup)
+margin_scheduler: MarginScheduler
+margin_update:
+  initial_margin: 0.0
+  final_margin: 0.4   # 稍微小一点的 margin，因为要做解耦，太强的主任务约束可能会抑制解耦
+  increase_start_epoch: 0
+  fix_start_epoch: 2
+  update_margin: true
+  increase_type: linear
+  epoch_iter: 2000    # 这个数值会在 train.py 运行时自动覆盖，不用管
+
+# -------------------------------------------------------------------
+# Optimizer (只优化 requires_grad=True 的参数)
+# -------------------------------------------------------------------
+loss: CrossEntropyLoss
+loss_args: {}
+
+optimizer: SGD # 或者 AdamW
+optimizer_args:
+  momentum: 0.9
+  nesterov: true
+  weight_decay: 0.0001
+
+scheduler: ExponentialDecrease
+scheduler_args:
+  initial_lr: 0.01  # LoRA 通常需要比全量微调大一点的学习率 (0.01 或 0.001) 0.005
+  final_lr: 0.0001
+  warm_up_epoch: 1 # 3
+  warm_from_zero: true

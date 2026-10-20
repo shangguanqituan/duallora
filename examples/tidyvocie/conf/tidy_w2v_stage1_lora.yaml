@@ -1,0 +1,115 @@
+# TidyVoice Stage 1: LoRA Adaptation (基于 VoxBlink 预训练模型)
+# 核心策略：低学习率 + 强正则化 + 冻结主干
+
+exp_dir: exp/tidy_w2vbert_lora_s1
+gpus: "[0,1,2,3,4,5,6,7]"
+num_avg: 2
+enable_amp: True
+seed: 42
+
+# TidyVoice 数据少，10个 Epoch 足够让 LoRA 适应，多了会过拟合
+num_epochs: 5
+save_epoch_interval: 1
+log_batch_interval: 100
+
+# -------------------------------------------------------------------
+# 数据加载
+# -------------------------------------------------------------------
+dataloader_args:
+  batch_size: 32           # 单卡32，8卡就是256，这对于 Metric Learning 足够大了
+  num_workers: 8
+  pin_memory: False
+  prefetch_factor: 4
+  drop_last: True
+
+# -------------------------------------------------------------------
+# 数据集参数 (关键修改)
+# -------------------------------------------------------------------
+dataset_args:
+  sample_num_per_epoch: 0
+  shuffle: True
+  shuffle_args:
+    shuffle_size: 2500
+  filter: True
+  filter_args:
+    min_num_frames: 200    # 2秒
+    max_num_frames: 800    # 4秒
+  resample_rate: 16000
+
+  # [重点 1] 开启变速 (Speed Perturb)
+  # 原始配置有，你之前的尝试关了。对于小数据集，这是防过拟合神器！
+  speed_perturb: True
+  num_frms: 300            # 3秒切片
+  aug_prob: 0.6            # 保持噪声增强
+
+  frontend: "w2vbert"
+  w2vbert_args:
+    model_name: "/data0/sgqt7/PTMs/w2v-bert-2.0"
+    frozen: True           # 必须冻结主干
+    use_lora: True
+    lora_config_args:
+      # [重点 2] 降低 LoRA 容量
+      # 原始是64，这里降为16。我们只需要微调，不需要重学
+      r: 16
+      lora_alpha: 32       # alpha 通常是 r 的 2 倍
+      target_modules: ["linear_q", "linear_v"]
+      # [重点 3] 增加 LoRA 内部 Dropout
+      lora_dropout: 0.1
+      bias: 'none'
+
+# -------------------------------------------------------------------
+# 模型定义
+# -------------------------------------------------------------------
+model: W2VBert_Adapter_MFA
+# [重点 4] 必须加载你训练好的 VoxBlink Checkpoint
+model_init: /data0/sgqt7/PTMs/w2v_bert2_voxblink_official_LM_lora.pth
+model_args:
+  feat_dim: 1024
+  embed_dim: 256
+  pooling_func: "ASP"
+  n_mfa_layers: -1
+  adapter_dim: 128
+  # [重点 5] 增加后端 Dropout
+  dropout: 0.2
+  num_frontend_hidden_layers: 24
+
+# -------------------------------------------------------------------
+# 损失与 Margin
+# -------------------------------------------------------------------
+projection_args:
+  project_type: arc_margin
+  scale: 32.0
+  easy_margin: false
+
+margin_scheduler: MarginScheduler
+margin_update:
+  initial_margin: 0.0
+  final_margin: 0.2
+  increase_start_epoch: 0
+  fix_start_epoch: 3
+  update_margin: true
+  increase_type: linear
+
+loss: CrossEntropyLoss
+loss_args: {}
+
+# -------------------------------------------------------------------
+# 优化器 (修正之前 Acc 飙升的元凶)
+# -------------------------------------------------------------------
+optimizer: AdamW
+optimizer_args:
+  # [重点 6] 学习率回归 1e-4
+  # 你之前设成了 1e-3 (0.001)，导致模型瞬间崩坏。
+  # 1e-4 是 LoRA 微调的标准值。
+  lr: 1.0e-4
+  weight_decay: 1.0e-2     # 稍微加大衰减
+
+# -------------------------------------------------------------------
+# 调度器
+# -------------------------------------------------------------------
+scheduler: WarmupCosineScheduler
+scheduler_args:
+  min_lr: 1.0e-6
+  max_lr: 1.0e-4           # 必须与 optimizer 的 lr 一致
+  warmup_epoch: 1
+  fix_epoch: 0

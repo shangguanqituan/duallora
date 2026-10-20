@@ -1,0 +1,126 @@
+# -------------------------------------------------------------------
+# Experiment & Hardware
+# -------------------------------------------------------------------
+exp_dir: exp/dual_lora_resnet293_tidy
+gpus: [0,1]
+num_avg: 1
+enable_amp: true # ResNet293 非常深，强烈建议开启 AMP 以节省显存和加速
+
+seed: 42
+num_epochs: 3 # LoRA 微调通常轮数较少。如果是极大数据集可适当减少，小数据集建议 5-10
+save_epoch_interval: 1
+log_batch_interval: 500
+
+# -------------------------------------------------------------------
+# Loss Weights (DualLoRA Executor 专用参数)
+# -------------------------------------------------------------------
+loss_weights:
+  spk: 1.0
+  lang: 0.5
+  orth: 0.1
+  adv: 0.0 # 根据你的策略，初始阶段可能为0，后续阶段开启对抗
+
+# -------------------------------------------------------------------
+# Data loader
+# -------------------------------------------------------------------
+data_type: shard
+train_data: data/tidyvoice_train/shards/train.shard.list
+train_label: data/tidyvoice_train/utt2spk
+
+dataloader_args:
+  # 注意：ResNet293 (293层) 比 SamResNet100 (100层) 显存占用大得多。
+  # 如果 SamResNet100 能跑 12，ResNet293 可能需要降到 6 或 8，否则容易 OOM。
+  batch_size: 10
+  num_workers: 8
+  pin_memory: false
+  prefetch_factor: 8
+  drop_last: true
+
+# -------------------------------------------------------------------
+# Dataset (保持与 SamResNet 相同的任务配置)
+# -------------------------------------------------------------------
+dataset_args:
+  sample_num_per_epoch: 0
+  shuffle: true
+  shuffle_args:
+    shuffle_size: 2500
+  filter: true
+  filter_args:
+    min_num_frames: 200
+    max_num_frames: 700
+  resample_rate: 16000
+  speed_perturb: false # 微调/解耦任务通常关闭变速
+  num_frms: 600       # 保持与 SamResNet 一致
+  aug_prob: 0.3       # 弱增强
+  fbank_args:
+    num_mel_bins: 80
+    frame_shift: 10
+    frame_length: 25
+    dither: 1.0
+  spec_aug: true
+  spec_aug_args:
+    num_t_mask: 1
+    num_f_mask: 1
+    max_t: 10
+    max_f: 8
+    prob: 0.6
+
+# -------------------------------------------------------------------
+# Model (ResNet293 Dual LoRA)
+# -------------------------------------------------------------------
+model: DualLoRA_ResNet293 # 对应代码中的接口函数名
+# 这是一个关键路径，必须指向预训练好的标准 ResNet293 模型，用于初始化 Base 分支
+# model_init: /path/to/pretrained/resnet293.pt
+model_args:
+  feat_dim: 80
+  embed_dim: 256
+  # ResNet 官方通常用 TSTP，但为了和你 SamResNet 任务对齐，这里用了 ASP。
+  # 如果报错或效果不好，可以改回 'TSTP'
+  pooling_func: 'TSTP'
+  two_emb_layer: False # DualLoRA 结构通常直出，不经过两层 embedding
+  spk_rank: 16
+  lang_rank: 4
+
+# -------------------------------------------------------------------
+# Projection (Sub-Center ArcFace)
+# -------------------------------------------------------------------
+projection_args:
+  project_type: arc_margin_intertopk_subcenter
+  scale: 32.0
+  easy_margin: false
+  K: 3             # Sub-center 数
+  mp: 0.06
+  k_top: 5
+  do_lm: true      # 对应 SamResNet 配置中的 LMF
+
+# -------------------------------------------------------------------
+# Margin Scheduler
+# -------------------------------------------------------------------
+margin_scheduler: MarginScheduler
+margin_update:
+  initial_margin: 0.0
+  final_margin: 0.3
+  increase_start_epoch: 0
+  fix_start_epoch: 2
+  update_margin: true
+  increase_type: linear
+  epoch_iter: 2000
+
+# -------------------------------------------------------------------
+# Optimization
+# -------------------------------------------------------------------
+loss: CrossEntropyLoss
+loss_args: {}
+
+optimizer: SGD
+optimizer_args:
+  momentum: 0.9
+  nesterov: true
+  weight_decay: 0.0001
+
+scheduler: ExponentialDecrease
+scheduler_args:
+  initial_lr: 0.01   # LoRA 学习率
+  final_lr: 0.0001
+  warm_up_epoch: 1
+  warm_from_zero: true
